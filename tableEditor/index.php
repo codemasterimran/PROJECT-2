@@ -98,10 +98,16 @@ if (isset($_GET['export'])) {
         }, $columns);
         fputcsv($output, $headers);
         
-        // Write all data
-        $stmt = $conn->query("SELECT * FROM `$table`");
-        while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+        // Write only the first row of data (or empty values if no data exists)
+        $stmt = $conn->query("SELECT * FROM `$table` LIMIT 1");
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        
+        if ($row) {
             fputcsv($output, $row);
+        } else {
+            // Create empty row if no data exists
+            $emptyRow = array_fill(0, count($headers), '');
+            fputcsv($output, $emptyRow);
         }
         
         fclose($output);
@@ -360,10 +366,10 @@ try {
                     </a>
                     <div class="nav-dropdown-content">
                         <a href="index.php?page=tables&action=new">
-                            <i class="fas fa-plus"></i> New Table
+                            <i class="fas fa-plus"></i> New Entry
                         </a>
                         <a href="index.php?page=tables&action=update">
-                            <i class="fas fa-edit"></i> Update Table
+                            <i class="fas fa-edit"></i> Update Entry
                         </a>
                     </div>
                 </div>
