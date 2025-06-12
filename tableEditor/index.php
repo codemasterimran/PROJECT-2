@@ -25,23 +25,16 @@ function getColumnAlias($tableName, $columnName) {
 // Handle database creation and SQL execution
 if (isset($_POST['execute_sql'])) {
     try {
-        // Create connection
         $conn = new PDO("mysql:host=".DB_HOST, DB_USER, DB_PASS);
         $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
         
-        // Create database if not exists
         $conn->exec("CREATE DATABASE IF NOT EXISTS `".DB_NAME."`");
         $conn->exec("USE `".DB_NAME."`");
         
-        // Process SQL file
         if (file_exists(SQL_FILE)) {
-            // Read SQL file content
             $sql = file_get_contents(SQL_FILE);
-            
-            // Remove comments to avoid errors
             $sql = preg_replace('/\/\*.*?\*\/|--.*?$/ms', '', $sql);
             
-            // Execute SQL statements one by one
             $queries = explode(';', $sql);
             foreach ($queries as $query) {
                 $query = trim($query);
@@ -49,20 +42,16 @@ if (isset($_POST['execute_sql'])) {
                     try {
                         $conn->exec($query);
                     } catch(PDOException $e) {
-                        // Ignore all table/column/key creation errors
                         continue;
                     }
                 }
             }
             
-            // Get all tables after execution and filter by visible tables
             $allTables = $conn->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN);
             $tables = array_intersect($allTables, $visibleTables);
             
             $_SESSION['tables'] = $tables;
             $_SESSION['success'] = "SQL file executed successfully! Database '".DB_NAME."' is ready.";
-            
-            // Redirect to tables page
             header("Location: index.php?page=tables");
             exit();
         } else {
@@ -75,39 +64,40 @@ if (isset($_POST['execute_sql'])) {
     }
 }
 
-// Handle export operations
+// Handle export operations - UPDATED TO CHECK FOR DATA
 if (isset($_GET['export'])) {
     try {
         $conn = new PDO("mysql:host=".DB_HOST.";dbname=".DB_NAME, DB_USER, DB_PASS);
         $table = $_GET['table'];
         
-        // Get table structure
         $stmt = $conn->query("DESCRIBE `$table`");
         $columns = $stmt->fetchAll(PDO::FETCH_ASSOC);
         
-        // Generate CSV content
+        header('Content-Type: text/csv; charset=utf-8');
+        header('Content-Disposition: attachment; filename="'.getTableAlias($table).'_'.date('Y-m-d').'.csv"');
+        
         $output = fopen('php://output', 'w');
         
-        // Set headers for download
-        header('Content-Type: text/csv; charset=utf-8');
-        header('Content-Disposition: attachment; filename="'.getTableAlias($table).'_data.csv"');
-        
-        // Write column headers
+        // Write headers
         $headers = array_map(function($col) use ($table) {
             return getColumnAlias($table, $col['Field']);
         }, $columns);
         fputcsv($output, $headers);
         
-        // Write only the first row of data (or empty values if no data exists)
-        $stmt = $conn->query("SELECT * FROM `$table` LIMIT 1");
-        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        // Check if table has data
+        $countStmt = $conn->query("SELECT COUNT(*) FROM `$table`");
+        $hasData = $countStmt->fetchColumn() > 0;
         
-        if ($row) {
-            fputcsv($output, $row);
+        if ($hasData) {
+            // Export all data
+            $stmt = $conn->query("SELECT * FROM `$table`");
+            while ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
+                fputcsv($output, $row);
+            }
         } else {
-            // Create empty row if no data exists
-            $emptyRow = array_fill(0, count($headers), '');
-            fputcsv($output, $emptyRow);
+            // Export empty template
+            $sampleRow = array_fill(0, count($columns), '');
+            fputcsv($output, $sampleRow);
         }
         
         fclose($output);
@@ -124,6 +114,7 @@ if (isset($_GET['export'])) {
 if (isset($_POST['import'])) {
     try {
         $table = $_POST['table'];
+        $action = $_POST['action'] ?? 'new';
         
         if (empty($_FILES['import_file']['name'])) {
             throw new Exception("No file selected for import.");
@@ -136,19 +127,39 @@ if (isset($_POST['import'])) {
             throw new Exception("Only CSV files are supported for import.");
         }
         
-        // Store the file in session for later processing
+        $fileContent = file_get_contents($file);
+        $fileHandle = tmpfile();
+        fwrite($fileHandle, $fileContent);
+        fseek($fileHandle, 0);
+        
+        $headers = fgetcsv($fileHandle);
+        if ($headers === FALSE) {
+            throw new Exception("Empty or invalid CSV file.");
+        }
+        
+        $rows = [];
+        while (($row = fgetcsv($fileHandle)) !== FALSE) {
+            if (!empty(array_filter($row))) {
+                $rows[] = $row;
+            }
+        }
+        fclose($fileHandle);
+        
         $_SESSION['import_data'] = [
             'table' => $table,
-            'file' => file_get_contents($file)
+            'action' => $action,
+            'headers' => $headers,
+            'rows' => $rows
         ];
         
-        $_SESSION['success'] = "File uploaded successfully. Click 'Execute' to apply changes.";
-        header("Location: index.php?page=tables&action=update&table=".urlencode($table));
+        $_SESSION['success'] = "File uploaded successfully. Data is ready for import.";
+        header("Location: index.php?page=tables&action=$action&table=".urlencode($table));
         exit();
         
     } catch(Exception $e) {
         $_SESSION['error'] = "Import failed: " . $e->getMessage();
-        header("Location: index.php?page=tables&action=update");
+        $action = $_POST['action'] ?? 'new';
+        header("Location: index.php?page=tables&action=$action");
         exit();
     }
 }
@@ -165,64 +176,63 @@ if (isset($_POST['create_records'])) {
             $importData = $_SESSION['import_data'];
             unset($_SESSION['import_data']);
             
-            // Process the imported file
-            $fileContent = $importData['file'];
-            $file = tmpfile();
-            fwrite($file, $fileContent);
-            fseek($file, 0);
+            $headers = $importData['headers'];
+            $rows = $importData['rows'];
             
-            // Read headers
-            $headers = fgetcsv($file);
-            if ($headers === FALSE) {
-                throw new Exception("Empty or invalid CSV file.");
-            }
-            
-            // Get all rows
-            $rows = [];
-            while (($row = fgetcsv($file)) !== FALSE) {
-                $rows[] = $row;
-            }
-            fclose($file);
-            
-            // Get table columns
             $stmt = $conn->query("DESCRIBE `$table`");
             $tableColumns = $stmt->fetchAll(PDO::FETCH_COLUMN);
             
-            // Map headers to table columns
             $columnMap = [];
-            foreach ($headers as $header) {
+            foreach ($headers as $headerIndex => $header) {
                 $header = trim($header);
                 foreach ($tableColumns as $column) {
                     if (getColumnAlias($table, $column) === $header) {
-                        $columnMap[$header] = $column;
+                        $columnMap[$headerIndex] = $column;
                         break;
                     }
                 }
             }
             
-            // Prepare insert statement
+            if (empty($columnMap)) {
+                throw new Exception("No matching columns found between CSV headers and table columns.");
+            }
+            
             $columnsStr = implode('`, `', array_values($columnMap));
             $placeholders = implode(',', array_fill(0, count($columnMap), '?'));
             $sql = "INSERT INTO `$table` (`$columnsStr`) VALUES ($placeholders)";
             $stmt = $conn->prepare($sql);
             
-            // Insert each row
             $rowCount = 0;
-            foreach ($rows as $row) {
+            $errors = [];
+            foreach ($rows as $rowIndex => $row) {
                 try {
-                    foreach ($columnMap as $index => $column) {
-                        $value = $row[$index] ?? '';
-                        $stmt->bindValue($index + 1, $value);
+                    $paramIndex = 1;
+                    foreach ($columnMap as $csvIndex => $column) {
+                        $value = $row[$csvIndex] ?? '';
+                        if ($value === '') {
+                            $stmt->bindValue($paramIndex, null, PDO::PARAM_NULL);
+                        } else {
+                            $stmt->bindValue($paramIndex, (string)$value);
+                        }
+                        $paramIndex++;
                     }
                     $stmt->execute();
                     $rowCount++;
                 } catch(PDOException $e) {
-                    // Ignore errors and continue with next row
+                    if (strpos($e->getMessage(), 'Duplicate entry') === false) {
+                        $errors[] = "Row " . ($rowIndex + 1) . ": " . $e->getMessage();
+                    }
                     continue;
                 }
             }
             
-            $_SESSION['success'] = "Successfully created $rowCount new records in table '".getTableAlias($table)."'";
+            if (!empty($errors)) {
+                $_SESSION['warning'] = "Imported $rowCount records with " . count($errors) . " errors. " . 
+                                      "First error: " . $errors[0];
+            } else {
+                $_SESSION['success'] = "Successfully created $rowCount new records in table '".getTableAlias($table)."'";
+            }
+            
             header("Location: index.php?page=tables&action=new&table=".urlencode($table));
             exit();
         } else {
@@ -244,38 +254,18 @@ if (isset($_POST['execute_update'])) {
         $table = $_POST['table'];
         $column = $_POST['column'];
         
-        // Process imported data if exists
         if (isset($_SESSION['import_data']) && $_SESSION['import_data']['table'] === $table) {
             $importData = $_SESSION['import_data'];
             unset($_SESSION['import_data']);
             
-            // Process the imported file
-            $fileContent = $importData['file'];
-            $file = tmpfile();
-            fwrite($file, $fileContent);
-            fseek($file, 0);
+            $headers = $importData['headers'];
+            $rows = $importData['rows'];
             
-            // Read headers
-            $headers = fgetcsv($file);
-            if ($headers === FALSE) {
-                throw new Exception("Empty or invalid CSV file.");
-            }
-            
-            // Get all rows
-            $rows = [];
-            while (($row = fgetcsv($file)) !== FALSE) {
-                $rows[] = $row;
-            }
-            fclose($file);
-            
-            // Process conditions
             $conditions = [];
             $params = [];
             
-            // Main column value
-            $params[] = $rows[0][0]; // First column value
+            $params[] = (string)($rows[0][0] ?? '');
             
-            // Process dynamic conditions
             $conditionCounter = 1;
             while (isset($_POST['logical_op_'.$conditionCounter])) {
                 $logicalOp = $_POST['logical_op_'.$conditionCounter];
@@ -283,14 +273,13 @@ if (isset($_POST['execute_update'])) {
                 $value = $_POST['value_'.$conditionCounter];
                 
                 if (!empty($secondColumn) && !empty($value)) {
-                    $conditions[] = "`$secondColumn` $logicalOp ?";
-                    $params[] = $value;
+                    $conditions[] = "`$secondColumn` = ?";
+                    $params[] = (string)$value;
                 }
                 
                 $conditionCounter++;
             }
             
-            // Build SQL
             $sql = "UPDATE `$table` SET `$column` = ?";
             if (!empty($conditions)) {
                 $sql .= " WHERE " . implode(" AND ", $conditions);
@@ -299,14 +288,13 @@ if (isset($_POST['execute_update'])) {
             $stmt = $conn->prepare($sql);
             $stmt->execute($params);
             
-            $_SESSION['success'] = "Update executed successfully on ".count($rows)." rows";
+            $affectedRows = $stmt->rowCount();
+            $_SESSION['success'] = "Update executed successfully.";
+            header("Location: index.php?page=tables&action=update&table=".urlencode($table));
+            exit();
         } else {
             throw new Exception("No import data found to execute.");
         }
-        
-        header("Location: index.php?page=tables&action=update&table=".urlencode($table));
-        exit();
-        
     } catch(Exception $e) {
         $_SESSION['error'] = "Execution failed: " . $e->getMessage();
         header("Location: index.php?page=tables&action=update&table=".urlencode($_POST['table']));
@@ -326,7 +314,6 @@ try {
     $tables = array_intersect($allTables, $visibleTables);
     $_SESSION['tables'] = $tables;
     
-    // Get columns for selected table
     $columns = [];
     if ($selectedTable) {
         $stmt = $conn->query("DESCRIBE `$selectedTable`");
@@ -337,6 +324,7 @@ try {
     $columns = [];
 }
 ?>
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -393,6 +381,14 @@ try {
                     <span class="close-btn" onclick="this.parentElement.remove()">&times;</span>
                 </div>
                 <?php unset($_SESSION['success']); ?>
+            <?php endif; ?>
+
+            <?php if (isset($_SESSION['warning'])): ?>
+                <div class="alert warning">
+                    <?= $_SESSION['warning'] ?>
+                    <span class="close-btn" onclick="this.parentElement.remove()">&times;</span>
+                </div>
+                <?php unset($_SESSION['warning']); ?>
             <?php endif; ?>
 
             <!-- Home Page -->
@@ -477,6 +473,15 @@ try {
                                 </button>
                             </form>
                         </div>
+                        
+                        <?php if (isset($_SESSION['import_data']) && $_SESSION['import_data']['table'] === $selectedTable && $_SESSION['import_data']['action'] === 'new'): ?>
+                        <form method="post" class="execute-import-form">
+                            <input type="hidden" name="table" value="<?= htmlspecialchars($selectedTable) ?>">
+                            <button type="submit" name="create_records" class="btn primary">
+                                <i class="fas fa-play"></i> Execute Import
+                            </button>
+                        </form>
+                        <?php endif; ?>
                     </div>
                 </div>
                 <?php elseif ($action === 'new'): ?>
@@ -496,13 +501,14 @@ try {
                     
                     <div class="update-form-container">
                         <div class="action-buttons">
-                        <button class="btn primary" onclick="exportTable('<?= htmlspecialchars($selectedTable) ?>')">
+                            <button class="btn primary" onclick="exportTable('<?= htmlspecialchars($selectedTable) ?>')">
                                 <i class="fas fa-download"></i> Export Data
                             </button>
                             
                             <div class="file-import-container">
                                 <form id="update-import-form" method="post" enctype="multipart/form-data">
                                     <input type="hidden" name="table" value="<?= htmlspecialchars($selectedTable) ?>">
+                                    <input type="hidden" name="action" value="update">
                                     <input type="file" id="update-browse-file" name="import_file" accept=".csv" style="display: none;" onchange="handleUpdateFileBrowse(this)">
                                     <button type="button" class="btn secondary" onclick="document.getElementById('update-browse-file').click()">
                                         <i class="fas fa-file-import"></i> Import Data
@@ -515,6 +521,7 @@ try {
                             </div>
                         </div>
                         
+                        <?php if (isset($_SESSION['import_data']) && $_SESSION['import_data']['table'] === $selectedTable && $_SESSION['import_data']['action'] === 'update'): ?>
                         <form id="update-query-form" method="post">
                             <input type="hidden" name="table" value="<?= htmlspecialchars($selectedTable) ?>">
                             
@@ -570,6 +577,7 @@ try {
                                 </button>
                             </div>
                         </form>
+                        <?php endif; ?>
                     </div>
                 </div>
                 <?php elseif ($action === 'update'): ?>
@@ -602,12 +610,10 @@ try {
 
     // Initialize dropdown system
     document.addEventListener('DOMContentLoaded', function() {
-        // Hide all dropdown contents initially
         document.querySelectorAll('.dropdown-content').forEach(dropdown => {
             dropdown.classList.remove('show');
         });
         
-        // Add click handlers to dropdown toggles
         document.querySelectorAll('.dropdown-toggle').forEach(button => {
             button.addEventListener('click', function(e) {
                 e.preventDefault();
@@ -616,12 +622,10 @@ try {
                 const dropdownContent = this.nextElementSibling;
                 const isCurrentlyOpen = dropdownContent.classList.contains('show');
                 
-                // Close all other dropdowns first
                 document.querySelectorAll('.dropdown-content').forEach(dropdown => {
                     dropdown.classList.remove('show');
                 });
                 
-                // Toggle current dropdown
                 if (!isCurrentlyOpen) {
                     dropdownContent.classList.add('show');
                     document.getElementById('table-search').focus();
@@ -629,14 +633,12 @@ try {
             });
         });
         
-        // Prevent dropdown content clicks from closing the dropdown
         document.querySelectorAll('.dropdown-content').forEach(dropdown => {
             dropdown.addEventListener('click', function(e) {
                 e.stopPropagation();
             });
         });
         
-        // Close dropdowns when clicking outside
         document.addEventListener('click', function(e) {
             if (!e.target.closest('.dropdown')) {
                 document.querySelectorAll('.dropdown-content').forEach(dropdown => {
@@ -645,7 +647,6 @@ try {
             }
         });
         
-        // Nav dropdown functionality
         document.querySelectorAll('.nav-dropdown > a').forEach(dropdown => {
             dropdown.addEventListener('click', function(e) {
                 e.preventDefault();
@@ -674,12 +675,8 @@ try {
 
     function selectTable(tableName) {
         selectedTableName = tableName;
-        
-        // Get current action from URL
         const urlParams = new URLSearchParams(window.location.search);
         const action = urlParams.get('action') || 'new';
-        
-        // Redirect to the same action but with selected table
         window.location.href = `index.php?page=tables&action=${action}&table=${encodeURIComponent(tableName)}`;
     }
 
